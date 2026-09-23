@@ -1,0 +1,5 @@
+data/original_dataset.csv
+.RData.Tmp
+.Rhistory
+.ipynb_checkpoints/
+analysis/data_analysis.Rmd

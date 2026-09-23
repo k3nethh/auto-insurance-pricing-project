@@ -1,0 +1,490 @@
+---
+title: "Auto Insurance Pricing & Out-of-Time Validation"
+author: "Kenneth Tran"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 8, fig.height = 5)
+library(tidyverse)
+library(MASS)
+```
+
+# Executive Summary
+
+This project develops an actuarial liability loss-cost model using automobile insurance policy-year data from 2022--2024. Model development was restricted to 2022 and 2023, while 2024 was held out as an untouched out-of-time test. Liability loss cost was decomposed into three components:
+
+\[
+\widehat{\text{Pure Premium}}=
+\widehat{\text{Claim Frequency}}
+\times
+\widehat{P(\text{positive loss}\mid\text{claim})}
+\times
+\widehat{\text{Positive Severity}}.
+\]
+
+A Negative Binomial GLM was used for liability claim frequency and a Gamma GLM with a log link was used for positive claim severity. Candidate specifications were trained on 2022 and validated on 2023 before the selected models were refit on all 2022--2023 experience.
+
+On the final 2024 test set, aggregate liability loss A/E was **1.072**, meaning actual losses were approximately 7.2% higher than predicted. Frequency was almost perfectly calibrated (A/E **1.001**), and the proportion of claims associated with positive incurred loss was stable (approximately **72.1%** historically versus **72.5%** in 2024). Most of the aggregate miss came from positive severity, which had an A/E of **1.063**. The final model also demonstrated useful risk segmentation: actual pure premium was approximately $144 in the lowest predicted-risk decile and $275 in the highest.
+
+# Data and Modeling Design
+
+```{r import-data}
+data <- read_delim("../data/original_dataset.csv", delim = ";")
+
+df <- data %>%
+  mutate(across(where(is.character), as.factor))
+```
+
+The dataset contains policy-year automobile insurance records for 2022--2024. The project focuses on **liability coverage** rather than total claims because total claim frequency is strongly affected by the number and type of coverages purchased. Restricting the analysis to liability makes claim experience more comparable across policy types.
+
+The temporal design is:
+
+- **2022:** model training and specification development.
+- **2023:** out-of-time validation and model selection.
+- **2022--2023:** refit the selected final models.
+- **2024:** untouched final out-of-time test.
+
+This design avoids randomly mixing future observations into model development and better reflects the practical use case of predicting future insurance experience from historical data.
+
+```{r historical-data}
+historical <- df %>% filter(year %in% c(2022, 2023))
+
+# Frequency models require positive exposure and complete model predictors.
+frequency_vars <- c("liability_claims", "liability_exposure", "driver_age",
+                    "vehicle_age", "bonus_score", "circulation_area",
+                    "municipality_type")
+
+filtered <- historical %>%
+  filter(liability_exposure > 0) %>%
+  filter(if_all(all_of(frequency_vars), ~ !is.na(.)))
+```
+
+One historical observation contained a liability claim with zero recorded liability exposure. Because a frequency GLM with a log-exposure offset requires strictly positive exposure, observations with nonpositive exposure are excluded from frequency modeling. Missing model predictors are also excluded consistently rather than removing rows by position.
+
+# Frequency Model
+
+## Poisson baseline and dispersion
+
+The baseline frequency model assumes
+
+\[
+N_i \sim \text{Poisson}(\mu_i),
+\qquad
+\log(\mu_i)=\log(E_i)+X_i\beta,
+\]
+
+where \(E_i\) is liability exposure. The exposure term enters as an offset so predictions are expected claim counts for each policy-year.
+
+```{r poisson-frequency}
+poisson_model <- glm(
+  liability_claims ~ driver_age + vehicle_age + I(vehicle_age^2) +
+    bonus_score + circulation_area + municipality_type,
+  family = poisson(link = "log"),
+  data = filtered,
+  offset = log(liability_exposure)
+)
+
+pearson_chi2 <- sum(residuals(poisson_model, type = "pearson")^2)
+poisson_dispersion <- pearson_chi2 / poisson_model$df.residual
+
+summary(poisson_model)
+poisson_dispersion
+```
+
+The Poisson Pearson dispersion statistic was approximately **1.40**, indicating moderate overdispersion. A Negative Binomial model was therefore considered because it allows conditional variance to exceed the conditional mean.
+
+## Negative Binomial model
+
+```{r nb-frequency}
+nb_model <- glm.nb(
+  liability_claims ~ driver_age + vehicle_age + I(vehicle_age^2) +
+    bonus_score + circulation_area + municipality_type +
+    offset(log(liability_exposure)),
+  data = filtered,
+  link = log
+)
+
+nb_pearson_chi2 <- sum(residuals(nb_model, type = "pearson")^2)
+nb_dispersion <- nb_pearson_chi2 / nb_model$df.residual
+
+summary(nb_model)
+nb_dispersion
+```
+
+The Negative Binomial model materially improved in-sample fit relative to Poisson (AIC approximately 120,468 versus 124,699) and reduced the Pearson dispersion statistic to approximately **1.11**. Coefficient estimates were broadly similar, but the Negative Binomial model produced more conservative standard errors. It was therefore retained as the frequency model family.
+
+## 2022 to 2023 specification validation
+
+Three age specifications were compared while keeping the remaining rating variables fixed.
+
+```{r frequency-validation}
+freq_train <- filtered %>% filter(year == 2022)
+freq_valid <- filtered %>% filter(year == 2023)
+
+freq_m1 <- glm.nb(
+  liability_claims ~ driver_age + vehicle_age + I(vehicle_age^2) +
+    bonus_score + circulation_area + municipality_type +
+    offset(log(liability_exposure)),
+  data = freq_train, link = log
+)
+
+freq_m2 <- glm.nb(
+  liability_claims ~ log(driver_age) + vehicle_age + I(vehicle_age^2) +
+    bonus_score + circulation_area + municipality_type +
+    offset(log(liability_exposure)),
+  data = freq_train, link = log
+)
+
+freq_m3 <- glm.nb(
+  liability_claims ~ driver_age + I(driver_age^2) + vehicle_age + I(vehicle_age^2) +
+    bonus_score + circulation_area + municipality_type +
+    offset(log(liability_exposure)),
+  data = freq_train, link = log
+)
+
+freq_pred1 <- predict(freq_m1, newdata = freq_valid, type = "response")
+freq_pred2 <- predict(freq_m2, newdata = freq_valid, type = "response")
+freq_pred3 <- predict(freq_m3, newdata = freq_valid, type = "response")
+
+freq_validation <- tibble(
+  model = c("Linear driver age", "Log driver age", "Quadratic driver age"),
+  AE = c(
+    sum(freq_valid$liability_claims) / sum(freq_pred1),
+    sum(freq_valid$liability_claims) / sum(freq_pred2),
+    sum(freq_valid$liability_claims) / sum(freq_pred3)
+  )
+)
+
+freq_validation
+```
+
+All three specifications produced nearly identical 2023 aggregate A/E values of approximately **0.961**. Decile analysis likewise showed little practical difference between the candidates, so additional complexity did not provide meaningful out-of-time improvement. The linear driver age specification was retained.
+
+```{r frequency-deciles, fig.cap="2023 actual and predicted liability claim frequency by predicted-frequency decile."}
+freq_decile <- ntile(freq_pred1 / freq_valid$liability_exposure, 10)
+
+freq_decile_table <- tibble(
+  decile = 1:10,
+  predicted_frequency = as.numeric(tapply(freq_pred1, freq_decile, sum) /
+                                     tapply(freq_valid$liability_exposure, freq_decile, sum)),
+  actual_frequency = as.numeric(tapply(freq_valid$liability_claims, freq_decile, sum) /
+                                  tapply(freq_valid$liability_exposure, freq_decile, sum))
+)
+
+freq_decile_table %>%
+  pivot_longer(c(actual_frequency, predicted_frequency),
+               names_to = "series", values_to = "frequency") %>%
+  ggplot(aes(decile, frequency, linetype = series)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(x = "Predicted-frequency decile", y = "Annual liability claim frequency",
+       linetype = NULL) +
+  theme_minimal()
+```
+
+Actual frequency generally increased with predicted frequency, indicating useful out-of-time risk discrimination.
+
+# Severity Model
+
+## Zero-incurred claims and positive severity
+
+Severity is observed at the policy-year level. For policy-year \(i\), average claim severity is
+
+\[
+S_i=\frac{L_i}{C_i},
+\]
+
+where \(L_i\) is liability incurred loss and \(C_i\) is liability claim count.
+
+A substantial share of liability claims had zero recorded incurred loss, concentrated almost entirely in liability property claims. Because a Gamma response must be strictly positive, the severity model is fit only to policy-years with positive incurred loss. The probability that a claim is associated with positive incurred loss is modeled separately at the portfolio level.
+
+```{r severity-data}
+severity_set <- filtered %>%
+  filter(liability_claims > 0) %>%
+  mutate(observed_severity = liability_incurred / liability_claims)
+
+positive_severity <- severity_set %>%
+  filter(liability_incurred > 0)
+
+positive_claim_probability <-
+  sum(positive_severity$liability_claims) / sum(severity_set$liability_claims)
+
+overall_claim_severity <-
+  sum(severity_set$liability_incurred) / sum(severity_set$liability_claims)
+
+positive_claim_severity <-
+  sum(positive_severity$liability_incurred) / sum(positive_severity$liability_claims)
+
+tibble(
+  positive_claim_probability,
+  overall_claim_severity,
+  positive_claim_severity
+)
+```
+
+Across 2022--2023, approximately **72.1%** of liability claims were associated with positive incurred loss. This proportion was extremely stable by year (approximately 72.2% in 2022 and 72.1% in 2023).
+
+Positive severity is strongly right-skewed. The unweighted mean observed positive severity was approximately $1,484, the median approximately $1,012, the 95th percentile approximately $4,129, and the maximum approximately $174,769.
+
+A notable data feature was a large concentration of 2023 liability property losses at exactly $1,012 per property claim. Approximately 3,411 policy-year rows followed this pattern, all in 2023. The documentation did not explain the concentration, so these observations were retained rather than treated as errors. Despite the distributional change, aggregate severity remained stable between 2022 and 2023, suggesting that the feature primarily affected the shape of the severity distribution rather than its overall mean.
+
+```{r severity-distribution, fig.cap="Distribution of positive observed liability severity, truncated at $10,000 for readability."}
+ggplot(positive_severity %>% filter(observed_severity < 10000),
+       aes(observed_severity)) +
+  geom_histogram(bins = 40) +
+  labs(x = "Positive liability severity", y = "Policy-year observations") +
+  theme_minimal()
+```
+
+## Gamma GLM
+
+A Gamma GLM with a log link is used to model positive average severity. Each policy-year is weighted by its liability claim count so that an average severity based on several claims carries more information than an average based on a single claim.
+
+```{r gamma-baseline}
+severity_model_full <- glm(
+  observed_severity ~ driver_age + vehicle_age + bonus_score +
+    circulation_area + municipality_type,
+  data = positive_severity,
+  family = Gamma(link = "log"),
+  weights = liability_claims
+)
+
+summary(severity_model_full)
+```
+
+Exploratory analysis suggested that positive severity generally increased with driver age outside the very sparse youngest group, while vehicle age showed a less consistent relationship. Bonus score, municipality type, and circulation area also showed differences in raw positive severity. Nonlinear age specifications improved in-sample AIC, but model selection was based on out-of-time performance rather than in-sample fit alone.
+
+## 2022 to 2023 severity validation
+
+```{r severity-validation}
+sev_train <- positive_severity %>% filter(year == 2022)
+sev_valid <- positive_severity %>% filter(year == 2023)
+
+sev_m1 <- glm(
+  observed_severity ~ driver_age + vehicle_age + bonus_score +
+    circulation_area + municipality_type,
+  data = sev_train, family = Gamma(link = "log"), weights = liability_claims
+)
+
+sev_m2 <- glm(
+  observed_severity ~ driver_age + I(driver_age^2) + vehicle_age + bonus_score +
+    circulation_area + municipality_type,
+  data = sev_train, family = Gamma(link = "log"), weights = liability_claims
+)
+
+sev_m3 <- glm(
+  observed_severity ~ driver_age + I(driver_age^2) + vehicle_age + I(vehicle_age^2) +
+    bonus_score + circulation_area + municipality_type,
+  data = sev_train, family = Gamma(link = "log"), weights = liability_claims
+)
+
+sev_pred1 <- predict(sev_m1, newdata = sev_valid, type = "response")
+sev_pred2 <- predict(sev_m2, newdata = sev_valid, type = "response")
+sev_pred3 <- predict(sev_m3, newdata = sev_valid, type = "response")
+
+severity_validation <- tibble(
+  model = c("Linear ages", "Quadratic driver age", "Quadratic driver and vehicle age"),
+  AE = c(
+    sum(sev_valid$liability_incurred) / sum(sev_valid$liability_claims * sev_pred1),
+    sum(sev_valid$liability_incurred) / sum(sev_valid$liability_claims * sev_pred2),
+    sum(sev_valid$liability_incurred) / sum(sev_valid$liability_claims * sev_pred3)
+  )
+)
+
+severity_validation
+```
+
+The three specifications produced 2023 positive-severity A/E values of approximately **0.974**, **0.979**, and **0.981**. Although the more flexible specifications were marginally closer to 1 in aggregate, decile-level calibration did not materially improve. The simpler linear-age specification was therefore retained for parsimony.
+
+Severity discrimination was weaker than frequency discrimination: predicted severity varied substantially across risk groups, while realized 2023 severity was noisy and did not rise consistently across predicted-severity deciles. This is an important limitation of the severity component.
+
+# Final Models and 2024 Out-of-Time Test
+
+After model selection, the chosen specifications are refit using all 2022--2023 observations.
+
+```{r final-models}
+frequency_model <- glm.nb(
+  liability_claims ~ driver_age + vehicle_age + I(vehicle_age^2) +
+    bonus_score + circulation_area + municipality_type +
+    offset(log(liability_exposure)),
+  data = filtered,
+  link = log
+)
+
+severity_model <- glm(
+  observed_severity ~ driver_age + vehicle_age + bonus_score +
+    circulation_area + municipality_type,
+  data = positive_severity,
+  family = Gamma(link = "log"),
+  weights = liability_claims
+)
+```
+
+The 2024 evaluation population is restricted using the same model requirements rather than deleting observations by row number.
+
+```{r final-test-data}
+data_2024 <- df %>% filter(year == 2024)
+
+filtered_2024 <- data_2024 %>%
+  filter(liability_exposure > 0) %>%
+  filter(if_all(all_of(frequency_vars), ~ !is.na(.)))
+
+predicted_frequency <- predict(frequency_model, newdata = filtered_2024,
+                               type = "response")
+predicted_severity <- predict(severity_model, newdata = filtered_2024,
+                              type = "response")
+
+predicted_liability <- positive_claim_probability *
+  predicted_frequency * predicted_severity
+
+final_ae <- sum(filtered_2024$liability_incurred) / sum(predicted_liability)
+final_ae
+```
+
+The final 2024 liability loss A/E was approximately **1.072**. Actual liability losses were therefore about 7.2% higher than the model prediction.
+
+## Decomposing the 2024 error
+
+```{r final-decomposition}
+freq_ae <- sum(filtered_2024$liability_claims) / sum(predicted_frequency)
+
+positive_severity_2024 <- filtered_2024 %>% filter(liability_incurred > 0)
+positive_sev_pred_2024 <- predict(severity_model,
+                                  newdata = positive_severity_2024,
+                                  type = "response")
+
+sev_ae <- sum(positive_severity_2024$liability_incurred) /
+  sum(positive_severity_2024$liability_claims * positive_sev_pred_2024)
+
+pcp_2024 <- sum(positive_severity_2024$liability_claims) /
+  sum((filtered_2024 %>% filter(liability_claims > 0))$liability_claims)
+
+tibble(
+  metric = c("Frequency A/E", "Positive severity A/E",
+             "Historical positive-loss probability", "2024 positive-loss probability"),
+  value = c(freq_ae, sev_ae, positive_claim_probability, pcp_2024)
+)
+```
+
+The decomposition shows that the final miss was driven primarily by severity:
+
+- Frequency A/E: **1.001**.
+- Positive-loss probability: approximately **72.1%** in 2022--2023 versus **72.5%** in 2024.
+- Positive-severity A/E: **1.063**.
+
+Thus, the model predicted the number of 2024 liability claims extremely well, and the positive-loss probability remained stable. Positive claims were simply more expensive in 2024 than the Gamma model predicted.
+
+# Pure Premium Risk Segmentation
+
+For each 2024 policy-year, predicted pure premium is predicted liability loss divided by liability exposure. Policies are grouped into deciles based on this exposure-normalized risk measure.
+
+```{r pure-premium-deciles}
+predicted_pp <- predicted_liability / filtered_2024$liability_exposure
+pp_bins <- ntile(predicted_pp, 10)
+
+pp_table <- tibble(
+  decile = 1:10,
+  exposure = as.numeric(tapply(filtered_2024$liability_exposure, pp_bins, sum)),
+  actual_losses = as.numeric(tapply(filtered_2024$liability_incurred, pp_bins, sum)),
+  predicted_losses = as.numeric(tapply(predicted_liability, pp_bins, sum)),
+  claims = as.numeric(tapply(filtered_2024$liability_claims, pp_bins, sum))
+) %>%
+  mutate(
+    actual_pp = actual_losses / exposure,
+    predicted_pp = predicted_losses / exposure,
+    AE = actual_losses / predicted_losses
+  )
+
+pp_table
+```
+
+```{r pure-premium-plot, fig.cap="2024 actual and predicted liability pure premium by predicted-risk decile."}
+pp_table %>%
+  dplyr::select(decile, actual_pp, predicted_pp) %>%
+  pivot_longer(c(actual_pp, predicted_pp), names_to = "series", values_to = "pure_premium") %>%
+  ggplot(aes(decile, pure_premium, linetype = series)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(x = "Predicted pure-premium decile", y = "Liability pure premium",
+       linetype = NULL) +
+  theme_minimal()
+```
+
+Predicted pure premium rose from approximately **$154** in the lowest predicted-risk decile to **$243** in the highest. Realized pure premium was approximately **$144** in the lowest decile and **$275** in the highest. Although realized losses were noisy across the middle deciles, the highest predicted-risk group experienced substantially higher loss cost than the lowest group, demonstrating useful out-of-time risk segmentation.
+
+# Business Interpretation and Rate Indication
+
+The 2024 evaluation population contained approximately **$30.60 million** in liability premium, **$24.41 million** in actual liability losses, **$22.76 million** in predicted liability losses, and **126,014** liability exposure units.
+
+```{r business-summary}
+liability_premium_2024 <- sum(filtered_2024$liability_premium)
+actual_losses_2024 <- sum(filtered_2024$liability_incurred)
+predicted_losses_2024 <- sum(predicted_liability)
+exposure_2024 <- sum(filtered_2024$liability_exposure)
+
+business_summary <- tibble(
+  metric = c("Liability premium", "Actual liability losses", "Predicted liability losses",
+             "Liability exposure", "Actual pure premium", "Predicted pure premium",
+             "Actual loss ratio", "Modeled expected loss ratio"),
+  value = c(
+    liability_premium_2024,
+    actual_losses_2024,
+    predicted_losses_2024,
+    exposure_2024,
+    actual_losses_2024 / exposure_2024,
+    predicted_losses_2024 / exposure_2024,
+    actual_losses_2024 / liability_premium_2024,
+    predicted_losses_2024 / liability_premium_2024
+  )
+)
+
+business_summary
+```
+
+The realized 2024 liability loss ratio was approximately **79.76%**, while the model implied an expected loss ratio of approximately **74.39%** based on information available from 2022--2023.
+
+Because the dataset does not provide the insurer's expense ratio, profit provision, contingency margin, or target loss ratio, no single required premium can be inferred. Instead, a sensitivity analysis illustrates how modeled expected losses could feed into an aggregate rate indication.
+
+```{r rate-indication}
+target_lr <- c(0.65, 0.70, 0.75)
+
+rate_indication <- tibble(
+  target_loss_ratio = target_lr,
+  required_premium = predicted_losses_2024 / target_lr,
+  indicated_rate_change = required_premium / liability_premium_2024 - 1,
+  required_premium_per_exposure = required_premium / exposure_2024
+)
+
+rate_indication
+```
+
+Under hypothetical target loss ratios of 65%, 70%, and 75%, the corresponding aggregate indicated rate changes are approximately **+14.44%**, **+6.27%**, and **-0.82%**, respectively. For example, under a hypothetical 70% target loss ratio, required premium would be approximately **$32.52 million**, compared with **$30.60 million** of existing liability premium.
+
+These indications are illustrative rather than recommendations. A production ratemaking analysis would require additional information such as expenses, profit and contingency provisions, loss development, trend, reinsurance, regulatory constraints, and underwriting considerations.
+
+# Limitations
+
+Several limitations should be considered when interpreting the results:
+
+1. **Aggregated claim records.** The data are policy-year aggregates rather than individual claim records. Positive severity is therefore modeled as average incurred loss per claim within a policy-year and weighted by claim count.
+2. **Zero-incurred claims.** A substantial number of liability property claims have zero incurred loss. The project handles this through a separate positive-loss probability rather than forcing zero values into the Gamma model.
+3. **2023 property-loss concentration.** Thousands of 2023 property-loss observations occur at exactly $1,012 per property claim, a pattern not explained in the dataset documentation. These observations were retained because there was no basis for treating them as errors.
+4. **Severity discrimination.** The Gamma model achieved reasonable aggregate out-of-time calibration but weaker decile-level discrimination than the frequency model.
+5. **Limited rating variables.** The models use a relatively small set of interpretable policy and geographic predictors and do not attempt exhaustive feature selection or interaction modeling.
+6. **Simplified rate indication.** Target loss ratios are hypothetical because insurer expense and profit assumptions are unavailable.
+
+# Conclusion
+
+This project demonstrates a complete actuarial loss-cost modeling workflow with a strict temporal validation design. A Negative Binomial frequency model addressed overdispersion in liability claim counts, while a claim-weighted Gamma GLM modeled positive liability severity. A separate positive-loss probability accommodated the large number of zero-incurred liability claims.
+
+After selecting model specifications using 2022-to-2023 validation, the models were refit on all 2022--2023 experience and evaluated once on untouched 2024 data. The combined model produced an aggregate 2024 A/E of **1.072**. Frequency was almost exactly calibrated, while higher-than-predicted positive severity accounted for most of the miss. Predicted pure premium also meaningfully separated lower- and higher-risk policies in the final out-of-time sample.
+
+The analysis illustrates both the strengths and limitations of traditional actuarial GLMs: they provide interpretable and reasonably calibrated portfolio-level predictions, while severity remains inherently noisy and harder to discriminate at the individual policy level.
