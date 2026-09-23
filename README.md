@@ -6,7 +6,7 @@ An actuarial loss-cost modeling project using automobile insurance policy-year d
 
 Liability loss cost is modeled as:
 
-$$
+```math
 \widehat{PP}
 =
 \widehat{F}
@@ -14,7 +14,7 @@ $$
 \widehat{P(L>0\mid C>0)}
 \times
 \widehat{S}
-$$
+```
 
 where:
 
