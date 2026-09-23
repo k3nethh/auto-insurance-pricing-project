@@ -6,7 +6,7 @@ An actuarial loss-cost modeling project using automobile insurance policy-year d
 
 Liability loss cost is modeled as:
 
-\[
+$$
 \widehat{\text{Pure Premium}}
 =
 \widehat{\text{Claim Frequency}}
@@ -14,7 +14,7 @@ Liability loss cost is modeled as:
 \widehat{P(\text{positive loss}\mid\text{claim})}
 \times
 \widehat{\text{Positive Severity}}
-\]
+$$
 
 The project uses a strict temporal validation design:
 
@@ -47,9 +47,9 @@ Positive liability severity is modeled with a **Gamma GLM with a log link**.
 
 The response is average incurred loss per claim within each policy-year:
 
-\[
+$$
 S_i = \frac{L_i}{C_i}
-\]
+$$
 
 and observations are weighted by liability claim count.
 
